@@ -1,0 +1,293 @@
+"""Design router — start a design, check status, respond to escalations.
+
+POST /api/v1/hx/design              → trigger design, return {session_id, stream_url, token}
+GET  /api/v1/hx/design/{id}/status   → poll fallback
+POST /api/v1/hx/design/{id}/respond  → user response to ESCALATED step
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Literal, Optional
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+
+from hx_engine.app.core.exceptions import CalculationError
+from hx_engine.app.core.redesign_loop import RedesignDriver
+from hx_engine.app.core.requirements_validator import validate_requirements, verify_token
+from hx_engine.app.core.session_store import SessionStore
+from hx_engine.app.core.sse_manager import SSEManager
+from hx_engine.app.core.volumetric_flow import (
+    FlowResolution,
+    apply_flow_inputs,
+)
+from hx_engine.app.dependencies import (
+    get_redesign_driver,
+    get_session_store,
+    get_sse_manager,
+)
+from hx_engine.app.models.design_state import DesignState, GeometrySpec
+from hx_engine.app.models.requirements import DesignRequest
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+router = APIRouter(tags=["design"])
+
+
+# ---------------------------------------------------------------------------
+# Request / Response schemas
+# ---------------------------------------------------------------------------
+
+class DesignResponse(BaseModel):
+    """Response from POST /api/v1/hx/design."""
+
+    session_id: str
+    stream_url: str   # relative path: /api/v1/hx/design/{id}/stream
+    token: str        # JWT for stream auth (stub for now)
+
+
+class DesignStatusResponse(BaseModel):
+    session_id: str
+    current_step: int
+    pipeline_status: str
+    waiting_for_user: bool
+    is_complete: bool
+    step_records: list[dict[str, Any]]
+    warnings: list[str]
+    notes: list[str]
+    escalation_history: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
+    property_provenance: Optional[dict[str, Any]] = None
+
+
+class UserResponse(BaseModel):
+    """Payload for POST /design/{session_id}/respond — user answers an ESCALATE."""
+
+    type: Literal["accept", "override", "skip"]
+    values: dict[str, Any] | None = None
+
+
+def _flow_audit(res: FlowResolution | None) -> dict | None:
+    """Serialise a :class:`FlowResolution` for the DesignState audit field."""
+    if res is None:
+        return None
+    return {
+        "value": res.input_value,
+        "unit": res.input_unit,
+        "basis": res.basis,
+        "m_dot_kg_s": res.m_dot_kg_s,
+        "density_kg_m3": res.density_kg_m3,
+        "density_source": res.density_source,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@router.post("/design", response_model=DesignResponse)
+async def start_design(
+    req: DesignRequest,
+    background_tasks: BackgroundTasks,
+    session_store: SessionStore = Depends(get_session_store),
+    sse_manager: SSEManager = Depends(get_sse_manager),
+    redesign_driver: RedesignDriver = Depends(get_redesign_driver),
+) -> DesignResponse:
+    """Create a new HX design session and start the pipeline in the background.
+
+    Defense in depth:
+    - If a token is provided (from POST /requirements), verify it.
+    - If no token (direct API call, tests), run inline validation.
+    In both cases invalid inputs are rejected before a session is created.
+    """
+    validation_dict = req.to_validation_dict()
+
+    # Resolve volumetric flow inputs to kg/s before token verification /
+    # inline validation (P2-20). The same deterministic resolution runs in
+    # /requirements, so the canonical (post-resolution) dict matches the
+    # signed payload.
+    try:
+        validation_dict, hot_res, cold_res = await apply_flow_inputs(
+            validation_dict,
+            hot_flow=validation_dict.get("hot_flow"),
+            cold_flow=validation_dict.get("cold_flow"),
+            hot_fluid_name=req.hot_fluid_name,
+            cold_fluid_name=req.cold_fluid_name,
+        )
+    except CalculationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "valid": False,
+                "errors": [{
+                    "field": "flow_input",
+                    "message": exc.message,
+                    "suggestion": "Provide m_dot_*_kg_s directly or fix the flow object.",
+                    "valid_range": "",
+                }],
+            },
+        )
+
+    if req.token:
+        if not verify_token(req.token, validation_dict):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid requirements token — call POST /requirements first or re-run it",
+            )
+    else:
+        # No token — run inline validation (direct API callers, tests, backend)
+        result = validate_requirements(validation_dict)
+        if not result.valid:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "valid": False,
+                    "errors": [
+                        {
+                            "field": e.field,
+                            "message": e.message,
+                            "suggestion": e.suggestion,
+                            "valid_range": e.valid_range,
+                        }
+                        for e in result.errors
+                    ],
+                },
+            )
+
+    # Build initial state from request
+    state = DesignState(
+        raw_request=req.raw_request or "",
+        user_id=req.user_id,
+        org_id=req.org_id,
+        mode=req.mode,
+        T_hot_in_C=req.T_hot_in_C,
+        T_hot_out_C=req.T_hot_out_C,
+        T_cold_in_C=req.T_cold_in_C,
+        T_cold_out_C=req.T_cold_out_C,
+        m_dot_hot_kg_s=validation_dict.get("m_dot_hot_kg_s"),
+        m_dot_cold_kg_s=validation_dict.get("m_dot_cold_kg_s"),
+        hot_fluid_name=req.hot_fluid_name,
+        cold_fluid_name=req.cold_fluid_name,
+        P_hot_Pa=req.P_hot_Pa,
+        P_cold_Pa=req.P_cold_Pa,
+        hot_phase=req.hot_phase,
+        cold_phase=req.cold_phase,
+        tema_preference=req.tema_preference,
+        hot_flow_input=_flow_audit(hot_res),
+        cold_flow_input=_flow_audit(cold_res),
+        # --- Engineering constraint intake fields ---
+        dP_hot_max_Pa=req.dP_hot_max_Pa,
+        dP_cold_max_Pa=req.dP_cold_max_Pa,
+        P_hot_design_Pa=req.P_hot_design_Pa,
+        P_cold_design_Pa=req.P_cold_design_Pa,
+        tube_material=req.tube_material,
+        fouling_hot_m2K_W=req.fouling_hot_m2K_W,
+        fouling_cold_m2K_W=req.fouling_cold_m2K_W,
+    )
+
+    # Fouling overrides — set R_f_* immediately so Step 4 skips the TEMA
+    # table lookup and uses the user-supplied values directly.
+    if req.fouling_hot_m2K_W is not None:
+        state.R_f_hot_m2KW = req.fouling_hot_m2K_W
+    if req.fouling_cold_m2K_W is not None:
+        state.R_f_cold_m2KW = req.fouling_cold_m2K_W
+
+    # Geometry pre-population — seed GeometrySpec with user hints so Step 4
+    # starts from the preferred values instead of computing them from scratch.
+    _geo_hints = {
+        "baffle_cut":       req.baffle_cut,
+        "shell_diameter_m": req.shell_diameter_m,
+        "tube_od_m":        req.tube_od_m,
+        "n_passes":         req.n_passes,
+    }
+    if any(v is not None for v in _geo_hints.values()):
+        if state.geometry is None:
+            state.geometry = GeometrySpec(**{k: v for k, v in _geo_hints.items() if v is not None})
+        else:
+            for k, v in _geo_hints.items():
+                if v is not None and getattr(state.geometry, k) is None:
+                    setattr(state.geometry, k, v)
+
+    session_id = state.session_id
+
+    # Pre-create SSE queue so the client can connect before the first event
+    sse_manager.get_queue(session_id)
+
+    # Persist initial state
+    await session_store.save(session_id, state)
+    await session_store.heartbeat(session_id)
+
+    # Launch pipeline in background — wrapped in the RedesignDriver so a
+    # downstream DesignConstraintViolation triggers an AI-driven
+    # upstream-lever tweak + restart-from-Step-1 loop instead of a hard
+    # failure.
+    background_tasks.add_task(redesign_driver.run, state)
+
+    return DesignResponse(
+        session_id=session_id,
+        stream_url=f"/api/v1/hx/design/{session_id}/stream",
+        token="stub-token",  # Real JWT in Week 6
+    )
+
+
+@router.get("/design/{session_id}/status", response_model=DesignStatusResponse)
+async def get_design_status(
+    session_id: str,
+    session_store: SessionStore = Depends(get_session_store),
+) -> DesignStatusResponse:
+    """Poll fallback — return the current progress of a design session."""
+    state = await session_store.load(session_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    return DesignStatusResponse(
+        session_id=state.session_id,
+        current_step=state.current_step,
+        pipeline_status=state.pipeline_status,
+        waiting_for_user=state.waiting_for_user,
+        is_complete=state.is_complete,
+        step_records=[r.model_dump() for r in state.step_records],
+        warnings=state.warnings,
+        notes=state.notes,
+        escalation_history=state.escalation_history,
+        property_provenance=state.property_provenance,
+    )
+
+
+@router.post("/design/{session_id}/respond")
+async def respond_to_escalation(
+    session_id: str,
+    response: UserResponse,
+    session_store: SessionStore = Depends(get_session_store),
+    sse_manager: SSEManager = Depends(get_sse_manager),
+) -> dict[str, str]:
+    """Provide user input for an ESCALATED step, resuming the pipeline."""
+    state = await session_store.load(session_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # The pipeline is "really" awaiting input iff either:
+    #   (a) the persisted state says so (state.waiting_for_user), or
+    #   (b) an in-process asyncio.Future has been created and not yet
+    #       resolved by sse_manager.create_user_response_future().
+    #
+    # (b) is the authoritative signal: the future is created inside
+    # _wait_for_user *after* the state.waiting_for_user=True save returns,
+    # and consumed *before* the subsequent waiting_for_user=False save, so
+    # there are short windows where the persisted flag lags the real
+    # in-memory state.  Relying on (a) alone caused the 410-on-click
+    # regression where users got
+    #   "Response window has expired. The pipeline already timed out or
+    #    completed."
+    # within seconds of the decision card appearing.  See
+    # test_respond_accepts_when_future_pending_even_if_state_flag_false.
+    future_pending = sse_manager.has_pending_user_response_future(session_id)
+    if not state.waiting_for_user and not future_pending:
+        # Pipeline really isn't waiting — the timeout fired or the step
+        # completed (or the session already responded once).
+        raise HTTPException(
+            status_code=410,
+            detail="Response window has expired. The pipeline already timed out or completed.",
+        )
+
+    sse_manager.resolve_user_response(session_id, response.model_dump())
+    return {"status": "received"}

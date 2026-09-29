@@ -1,0 +1,1543 @@
+"""Tests for Layer 2 → Escalation routing fix in PipelineRunner.
+
+Covers the bug where Layer 2 failure discards AI escalation:
+- Layer 2 fails + AI ESCALATE present → step_escalated emitted (not step_error)
+- Layer 2 fails + NO AI escalation → hard-stop preserved (step_error)
+- Layer 2 fails + AI decision is PROCEED → hard-stop preserved
+- Layer 2 passes → normal flow (no regression)
+- Escalation count exhausted → step_error with full history
+- CalculationError / StepHardFailure → hard-stop preserved (exception paths)
+
+Reference: bug_draft_step7_velocity_hard_fail_no_escalation.md
+           bug_draft_pipeline_layer2_discards_ai_escalation.md
+"""
+
+from __future__ import annotations
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from hx_engine.app.core.ai_engineer import AIEngineer
+from hx_engine.app.core.exceptions import CalculationError, StepHardFailure
+from hx_engine.app.core.pipeline_runner import PipelineRunner
+from hx_engine.app.core.session_store import SessionStore
+from hx_engine.app.core.sse_manager import SSEManager
+from hx_engine.app.core.validation_rules import ValidationResult
+from hx_engine.app.models.design_state import DesignState, FluidProperties, GeometrySpec
+from hx_engine.app.models.step_result import (
+    AIDecisionEnum,
+    AIModeEnum,
+    AIReview,
+    AttemptRecord,
+    StepResult,
+)
+from hx_engine.app.steps.base import BaseStep
+from hx_engine.app.core.design_intent import is_termination_intent
+
+
+# ===================================================================
+# Test Fixtures
+# ===================================================================
+
+@pytest.fixture
+def mock_sse_manager():
+    """Mock SSEManager that captures emitted events."""
+    manager = AsyncMock(spec=SSEManager)
+    manager.emitted_events = []
+
+    async def capture_emit(session_id, event):
+        manager.emitted_events.append(event)
+
+    manager.emit = capture_emit
+    return manager
+
+
+@pytest.fixture
+def mock_session_store():
+    """Mock SessionStore with basic save/heartbeat/orphan check."""
+    store = AsyncMock(spec=SessionStore)
+    store.is_orphaned = AsyncMock(return_value=False)
+    store.heartbeat = AsyncMock()
+    store.save = AsyncMock()
+    return store
+
+
+@pytest.fixture
+def mock_ai_engineer():
+    """Mock AIEngineer (not used in these tests — we mock step results directly)."""
+    return AsyncMock(spec=AIEngineer)
+
+
+@pytest.fixture
+def pipeline_runner(mock_session_store, mock_sse_manager, mock_ai_engineer):
+    """PipelineRunner with mocked dependencies."""
+    return PipelineRunner(
+        session_store=mock_session_store,
+        sse_manager=mock_sse_manager,
+        ai_engineer=mock_ai_engineer,
+    )
+
+
+@pytest.fixture
+def base_state():
+    """Minimal DesignState for pipeline tests."""
+    return DesignState(
+        session_id="test-session-123",
+        hot_fluid_name="water",
+        cold_fluid_name="water",
+        T_hot_in_C=90.0,
+        T_hot_out_C=60.0,
+        T_cold_in_C=25.0,
+        T_cold_out_C=45.0,
+    )
+
+
+# ===================================================================
+# Test Step Classes
+# ===================================================================
+
+class MockStep(BaseStep):
+    """A mock step that returns a pre-configured result from run_with_review_loop."""
+
+    step_id = 7
+    step_name = "Tube-Side H"
+    ai_mode = AIModeEnum.FULL
+
+    def __init__(self, result: StepResult):
+        self._result = result
+
+    async def execute(self, state: DesignState) -> StepResult:
+        return self._result
+
+    async def run_with_review_loop(self, state, ai_engineer) -> StepResult:
+        """Override to return pre-configured result directly, bypassing AI calls."""
+        return self._result
+
+
+# ===================================================================
+# Helper Functions
+# ===================================================================
+
+def _make_escalate_review(
+    reasoning: str = "Velocity critically low — geometry undersized",
+    recommendation: str = "Swap fluid allocation or restart with higher U",
+    options: list[str] | None = None,
+    attempts: list[AttemptRecord] | None = None,
+) -> AIReview:
+    """Create an ESCALATE AIReview with diagnosis and options."""
+    return AIReview(
+        decision=AIDecisionEnum.ESCALATE,
+        confidence=0.0,
+        reasoning=reasoning,
+        recommendation=recommendation,
+        options=options or ["Swap oil to shell-side", "Restart with U=150"],
+        attempts=attempts or [],
+        ai_called=True,
+    )
+
+
+def _make_proceed_review(confidence: float = 0.9) -> AIReview:
+    """Create a PROCEED AIReview."""
+    return AIReview(
+        decision=AIDecisionEnum.PROCEED,
+        confidence=confidence,
+        reasoning="Values within acceptable range",
+        ai_called=True,
+    )
+
+
+def _make_validation_result(
+    passed: bool,
+    errors: list[str] | None = None,
+    *,
+    correctable: bool = True,
+) -> ValidationResult:
+    """Create a ValidationResult for mocking."""
+    vr = ValidationResult()
+    vr.passed = passed
+    vr.errors = errors or []
+    if not passed:
+        if correctable:
+            vr.has_correctable_failure = True
+        else:
+            vr.has_uncorrectable_failure = True
+    return vr
+
+
+def _get_emitted_event_types(mock_sse_manager) -> list[str]:
+    """Extract event type strings from emitted SSE events."""
+    types = []
+    for event in mock_sse_manager.emitted_events:
+        if isinstance(event, dict):
+            # SSE events use "event_type" field
+            event_type = event.get("event_type") or event.get("type")
+            if event_type:
+                types.append(event_type)
+    return types
+
+
+# ===================================================================
+# Phase 1 Tests: Layer 2 Failure Routing
+# ===================================================================
+
+class TestLayer2FailureWithAIEscalation:
+    """Layer 2 fails + AI ESCALATE present → step_escalated emitted, NOT step_error."""
+
+    @pytest.mark.asyncio
+    async def test_layer2_fail_with_ai_escalation_routes_to_escalation(
+        self, pipeline_runner, mock_sse_manager, mock_session_store, base_state
+    ):
+        """When Layer 2 fails but AI already produced ESCALATE, emit step_escalated."""
+        # Arrange: result with ESCALATE decision
+        escalate_review = _make_escalate_review()
+        result_with_escalate = StepResult(
+            step_id=7,
+            step_name="Tube-Side H",
+            outputs={"tube_velocity_m_s": 0.122, "h_tube_W_m2K": 500.0},
+            ai_review=escalate_review,
+        )
+        mock_step = MockStep(result_with_escalate)
+
+        # Mock Layer 2 to fail
+        failed_vr = _make_validation_result(
+            passed=False,
+            errors=["Tube velocity 0.122 m/s below hard minimum 0.3 m/s"],
+        )
+
+        # Create a future that resolves immediately with user response
+        user_response_future = asyncio.Future()
+        user_response_future.set_result({"type": "skip", "values": {}})
+        mock_sse_manager.create_user_response_future = MagicMock(
+            return_value=user_response_future
+        )
+
+        with patch(
+            "hx_engine.app.core.pipeline_runner.PIPELINE_STEPS",
+            [lambda: mock_step],
+        ), patch(
+            "hx_engine.app.core.pipeline_runner.check_validation_rules",
+            return_value=failed_vr,
+        ):
+            await pipeline_runner.run(base_state)
+
+        # Assert: step_escalated was emitted, not step_error
+        event_types = _get_emitted_event_types(mock_sse_manager)
+        assert "step_escalated" in event_types, f"Expected step_escalated, got: {event_types}"
+        # step_error should NOT appear for the initial escalation
+        # (it may appear later if escalation is exhausted)
+
+
+class TestLayer2FailureWithoutAIEscalation:
+    """Layer 2 fails + NO AI escalation → recovery attempted."""
+
+    @pytest.mark.asyncio
+    async def test_layer2_fail_non_correctable_escalates_to_user(
+        self, pipeline_runner, mock_sse_manager, mock_session_store, base_state
+    ):
+        """Non-correctable Layer 2 failure → ESCALATE to user (not hard-stop)."""
+        result_no_ai = StepResult(
+            step_id=7,
+            step_name="Tube-Side H",
+            outputs={"tube_velocity_m_s": 0.122},
+            ai_review=None,
+        )
+        mock_step = MockStep(result_no_ai)
+
+        failed_vr = _make_validation_result(
+            passed=False,
+            errors=["Tube velocity 0.122 m/s below hard minimum 0.3 m/s"],
+            correctable=False,
+        )
+
+        # Create a future that resolves immediately with user response
+        user_response_future = asyncio.Future()
+        user_response_future.set_result({"type": "skip", "values": {}})
+        mock_sse_manager.create_user_response_future = MagicMock(
+            return_value=user_response_future
+        )
+
+        with patch(
+            "hx_engine.app.core.pipeline_runner.PIPELINE_STEPS",
+            [lambda: mock_step],
+        ), patch(
+            "hx_engine.app.core.pipeline_runner.check_validation_rules",
+            return_value=failed_vr,
+        ):
+            await pipeline_runner.run(base_state)
+
+        # Assert: recovery produces ESCALATE, not immediate step_error
+        event_types = _get_emitted_event_types(mock_sse_manager)
+        assert "step_escalated" in event_types
+
+    @pytest.mark.asyncio
+    async def test_layer2_fail_correctable_triggers_ai_recovery(
+        self, pipeline_runner, mock_sse_manager, mock_session_store, base_state
+    ):
+        """Correctable Layer 2 failure → AI recovery loop entered."""
+        # The MockStep.run_with_review_loop returns the pre-set result.
+        # After recovery, Layer 2 still fails → hard-stop.
+        result_no_ai = StepResult(
+            step_id=7,
+            step_name="Tube-Side H",
+            outputs={"tube_velocity_m_s": 0.122},
+            ai_review=None,
+        )
+        mock_step = MockStep(result_no_ai)
+
+        failed_vr = _make_validation_result(
+            passed=False,
+            errors=["Tube velocity 0.122 m/s below hard minimum 0.3 m/s"],
+            correctable=True,
+        )
+
+        with patch(
+            "hx_engine.app.core.pipeline_runner.PIPELINE_STEPS",
+            [lambda: mock_step],
+        ), patch(
+            "hx_engine.app.core.pipeline_runner.check_validation_rules",
+            return_value=failed_vr,
+        ):
+            state = await pipeline_runner.run(base_state)
+
+        # Recovery loop runs but MockStep still returns same bad result,
+        # so Layer 2 re-check fails and pipeline errors.
+        assert state.pipeline_status == "error"
+        event_types = _get_emitted_event_types(mock_sse_manager)
+        assert "step_error" in event_types
+
+
+class TestLayer2FailureWithNonEscalateAI:
+    """Layer 2 fails + AI said PROCEED → recovery attempted."""
+
+    @pytest.mark.asyncio
+    async def test_layer2_fail_with_proceed_correctable_triggers_recovery(
+        self, pipeline_runner, mock_sse_manager, mock_session_store, base_state
+    ):
+        """When Layer 2 fails and AI said PROCEED, recovery loop runs.
+
+        MockStep always returns the same bad result, so after recovery
+        the re-check still fails and the pipeline errors.
+        """
+        proceed_review = _make_proceed_review(confidence=0.85)
+        result_proceed = StepResult(
+            step_id=7,
+            step_name="Tube-Side H",
+            outputs={"tube_velocity_m_s": 0.122},
+            ai_review=proceed_review,
+        )
+        mock_step = MockStep(result_proceed)
+
+        failed_vr = _make_validation_result(
+            passed=False,
+            errors=["Tube velocity 0.122 m/s below hard minimum 0.3 m/s"],
+            correctable=True,
+        )
+
+        with patch(
+            "hx_engine.app.core.pipeline_runner.PIPELINE_STEPS",
+            [lambda: mock_step],
+        ), patch(
+            "hx_engine.app.core.pipeline_runner.check_validation_rules",
+            return_value=failed_vr,
+        ):
+            state = await pipeline_runner.run(base_state)
+
+        # Recovery tried but MockStep still returns bad value → hard-stop
+        event_types = _get_emitted_event_types(mock_sse_manager)
+        assert "step_error" in event_types
+        assert state.pipeline_status == "error"
+
+
+class TestLayer2PassesNormalFlow:
+    """Layer 2 passes → escalation routing code is not reached (no regression)."""
+
+    @pytest.mark.asyncio
+    async def test_layer2_passes_normal_flow_not_affected(
+        self, pipeline_runner, mock_sse_manager, mock_session_store, base_state
+    ):
+        """When Layer 2 passes, step proceeds normally without escalation detour."""
+        proceed_review = _make_proceed_review(confidence=0.9)
+        result_ok = StepResult(
+            step_id=7,
+            step_name="Tube-Side H",
+            outputs={"tube_velocity_m_s": 1.2, "h_tube_W_m2K": 5000.0},
+            ai_review=proceed_review,
+        )
+        mock_step = MockStep(result_ok)
+
+        passed_vr = _make_validation_result(passed=True)
+
+        async def _noop_post(state, session_id, step):
+            return state
+
+        with patch(
+            "hx_engine.app.core.pipeline_runner.PIPELINE_STEPS",
+            [lambda: mock_step],
+        ), patch(
+            "hx_engine.app.core.pipeline_runner.check_validation_rules",
+            return_value=passed_vr,
+        ), patch.object(
+            # Skip the convergence loop so we test only Layer 2 routing
+            pipeline_runner, "_run_convergence_loop",
+            return_value=base_state,
+        ), patch.object(
+            pipeline_runner, "_run_post_convergence_step",
+            side_effect=_noop_post,
+        ):
+            state = await pipeline_runner.run(base_state)
+
+        event_types = _get_emitted_event_types(mock_sse_manager)
+        assert "step_approved" in event_types
+        assert "step_error" not in event_types
+        assert "step_escalated" not in event_types
+        # Pipeline completes when convergence + post-convergence are skipped
+        assert state.pipeline_status == "completed"
+
+
+# ===================================================================
+# Phase 3 Tests: Exception Paths and Non-Regression
+# ===================================================================
+
+class TestExceptionPathsPreserved:
+    """CalculationError and StepHardFailure still hard-stop regardless."""
+
+    @pytest.mark.asyncio
+    async def test_calculation_error_still_hard_stops(
+        self, pipeline_runner, mock_sse_manager, mock_session_store, base_state
+    ):
+        """CalculationError from step still hard-stops with step_error."""
+
+        class RaisingStep(BaseStep):
+            step_id = 7
+            step_name = "Tube-Side H"
+            ai_mode = AIModeEnum.FULL
+
+            async def execute(self, state: DesignState) -> StepResult:
+                raise CalculationError("Missing geometry data")
+
+            async def run_with_review_loop(self, state, ai_engineer) -> StepResult:
+                raise CalculationError("Missing geometry data")
+
+        with patch(
+            "hx_engine.app.core.pipeline_runner.PIPELINE_STEPS",
+            [RaisingStep],
+        ):
+            state = await pipeline_runner.run(base_state)
+
+        event_types = _get_emitted_event_types(mock_sse_manager)
+        assert "step_error" in event_types
+        assert "step_escalated" not in event_types
+        assert state.pipeline_status == "error"
+
+    @pytest.mark.asyncio
+    async def test_step_hard_failure_still_hard_stops(
+        self, pipeline_runner, mock_sse_manager, mock_session_store, base_state
+    ):
+        """StepHardFailure from step still hard-stops with step_error."""
+
+        class HardFailStep(BaseStep):
+            step_id = 7
+            step_name = "Tube-Side H"
+            ai_mode = AIModeEnum.FULL
+
+            async def execute(self, state: DesignState) -> StepResult:
+                raise StepHardFailure(["Hard rule violated inside loop"])
+
+            async def run_with_review_loop(self, state, ai_engineer) -> StepResult:
+                raise StepHardFailure(["Hard rule violated inside loop"])
+
+        with patch(
+            "hx_engine.app.core.pipeline_runner.PIPELINE_STEPS",
+            [HardFailStep],
+        ):
+            state = await pipeline_runner.run(base_state)
+
+        event_types = _get_emitted_event_types(mock_sse_manager)
+        assert "step_error" in event_types
+        assert "step_escalated" not in event_types
+        assert state.pipeline_status == "error"
+
+
+class TestNormalEscalateNotRegressed:
+    """Normal ESCALATE (Layer 2 passes, AI ESCALATE) still routes to escalation loop."""
+
+    @pytest.mark.asyncio
+    async def test_normal_escalate_layer2_passes_still_works(
+        self, pipeline_runner, mock_sse_manager, mock_session_store, base_state
+    ):
+        """When Layer 2 passes but AI returns ESCALATE, step_escalated is emitted."""
+        escalate_review = _make_escalate_review(
+            reasoning="Ambiguous TEMA type for this service",
+            options=["Use AES", "Use AEP"],
+        )
+        result = StepResult(
+            step_id=4,
+            step_name="TEMA Geometry",
+            outputs={},
+            ai_review=escalate_review,
+        )
+        mock_step = MockStep(result)
+        mock_step.step_id = 4
+        mock_step.step_name = "TEMA Geometry"
+
+        passed_vr = _make_validation_result(passed=True)
+
+        # Create a future that resolves immediately with user response
+        user_response_future = asyncio.Future()
+        user_response_future.set_result({"type": "skip", "values": {}})
+        mock_sse_manager.create_user_response_future = MagicMock(
+            return_value=user_response_future
+        )
+
+        with patch(
+            "hx_engine.app.core.pipeline_runner.PIPELINE_STEPS",
+            [lambda: mock_step],
+        ), patch(
+            "hx_engine.app.core.pipeline_runner.check_validation_rules",
+            return_value=passed_vr,
+        ):
+            await pipeline_runner.run(base_state)
+
+        event_types = _get_emitted_event_types(mock_sse_manager)
+        assert "step_escalated" in event_types
+
+
+class TestEscalationExhausted:
+    """Layer 2 fail + persistent ESCALATE → max_escalations reached → step_error."""
+
+    @pytest.mark.asyncio
+    async def test_escalation_exhausted_after_max_responses_emits_error(
+        self, mock_session_store, mock_sse_manager, mock_ai_engineer, base_state
+    ):
+        """When Layer 2 fail + ESCALATE persists past max_escalations, emit step_error.
+
+        Drives the new fall-through path (Layer 2 fail + ai_has_escalation) through
+        the full escalation loop until exhaustion. Guards against regressions in the
+        max_escalations guard — the safeguard against an infinite escalation loop.
+        """
+        # Pin to max_escalations=2 so the count is deterministic regardless of
+        # any future change to the configuration default.
+        pipeline_runner = PipelineRunner(
+            session_store=mock_session_store,
+            sse_manager=mock_sse_manager,
+            ai_engineer=mock_ai_engineer,
+            max_escalations=2,
+        )
+
+        # Arrange: step always returns ESCALATE; Layer 2 always fails
+        escalate_review = _make_escalate_review()
+        persistent_escalate = StepResult(
+            step_id=7,
+            step_name="Tube-Side H",
+            outputs={"tube_velocity_m_s": 0.122, "h_tube_W_m2K": 500.0},
+            ai_review=escalate_review,
+        )
+        mock_step = MockStep(persistent_escalate)
+        failed_vr = _make_validation_result(
+            passed=False,
+            errors=["Tube velocity 0.122 m/s below hard minimum 0.3 m/s"],
+        )
+
+        # Each await on a Future consumes it, so create_user_response_future
+        # must hand out a fresh resolved future per call.
+        def _fresh_future(_session_id):
+            fut = asyncio.Future()
+            fut.set_result({"type": "skip", "values": {}})
+            return fut
+
+        mock_sse_manager.create_user_response_future = MagicMock(side_effect=_fresh_future)
+
+        with patch(
+            "hx_engine.app.core.pipeline_runner.PIPELINE_STEPS",
+            [lambda: mock_step],
+        ), patch(
+            "hx_engine.app.core.pipeline_runner.check_validation_rules",
+            return_value=failed_vr,
+        ):
+            state = await pipeline_runner.run(base_state)
+
+        # Assert: legitimate escalation exhaustion, not an internal pipeline crash.
+        # step_escalated fires 3 times (iterations 1, 2, 3 each emit via
+        # _emit_decision_event), then the exhaustion block emits step_error.
+        event_types = _get_emitted_event_types(mock_sse_manager)
+        assert event_types.count("step_escalated") == 3
+        assert event_types[-1] == "step_error"
+        # The user-facing message must NOT leak internal escalation accounting
+        # (no "max escalation attempts (N) reached" wording — that's a bug).
+        last_error = next(
+            e for e in reversed(mock_sse_manager.emitted_events)
+            if isinstance(e, dict) and e.get("event_type") == "step_error"
+        )
+        assert "max escalation" not in last_error.get("message", "").lower()
+        assert "could not be completed" in last_error.get("message", "")
+
+
+class TestStep7EscalationOptionHandling:
+    """Tests for Step 7 velocity escalation option handlers — via step.apply_user_override()."""
+
+    async def test_step7_option_a_swaps_fluid_allocation(self, base_state):
+        from hx_engine.app.steps.step_07_tube_side_h import Step07TubeSideH
+        base_state.shell_side_fluid = "hot"
+        result = await Step07TubeSideH().apply_user_override(base_state, option_index=0, text="")
+        assert result == 3
+        assert base_state.shell_side_fluid == "cold"
+
+    async def test_step7_option_b_modifies_geometry(self, base_state):
+        from hx_engine.app.models.design_state import GeometrySpec
+        from hx_engine.app.steps.step_07_tube_side_h import Step07TubeSideH
+        base_state.geometry = GeometrySpec(
+            n_tubes=200, n_passes=1, shell_diameter_m=0.5,
+            tube_od_m=0.02, tube_id_m=0.016, tube_length_m=3.0,
+            baffle_spacing_m=0.2, pitch_ratio=1.25, baffle_cut=0.25,
+        )
+        result = await Step07TubeSideH().apply_user_override(base_state, option_index=1, text="")
+        assert result is None
+        assert base_state.geometry.n_tubes == 100
+        assert base_state.geometry.n_passes == 2
+
+    async def test_step7_option_b_respects_n_passes_limit(self, base_state):
+        from hx_engine.app.models.design_state import GeometrySpec
+        from hx_engine.app.steps.step_07_tube_side_h import Step07TubeSideH
+        base_state.geometry = GeometrySpec(
+            n_tubes=100, n_passes=6, shell_diameter_m=0.5,
+            tube_od_m=0.02, tube_id_m=0.016, tube_length_m=3.0,
+            baffle_spacing_m=0.2, pitch_ratio=1.25, baffle_cut=0.25,
+        )
+        await Step07TubeSideH().apply_user_override(base_state, option_index=1, text="")
+        assert base_state.geometry.n_passes == 8
+
+    async def test_step7_regex_fallback_for_velocity_increase(self, base_state):
+        from hx_engine.app.models.design_state import GeometrySpec
+        from hx_engine.app.steps.step_07_tube_side_h import Step07TubeSideH
+        base_state.geometry = GeometrySpec(
+            n_tubes=200, n_passes=1, shell_diameter_m=0.5,
+            tube_od_m=0.02, tube_id_m=0.016, tube_length_m=3.0,
+            baffle_spacing_m=0.2, pitch_ratio=1.25, baffle_cut=0.25,
+        )
+        await Step07TubeSideH().apply_user_override(
+            base_state, option_index=-1, text="Please reduce n_tubes and increase velocity",
+        )
+        assert base_state.geometry.n_tubes == 100
+        assert base_state.geometry.n_passes == 2
+
+
+# ===================================================================
+# Phase 4 Tests: Termination Intent Detection
+# ===================================================================
+
+class TestTerminationIntentDetection:
+    """Unit tests for is_termination_intent — phrase matching logic."""
+
+    def test_flag_design_as_impractical(self):
+        """Option text 'Flag design as impractical...' triggers termination."""
+        text = "Flag design as impractical and recommend plate or double-pipe exchanger to the user"
+        assert is_termination_intent(text) is True
+
+    def test_terminate_keyword(self):
+        """Text containing 'terminate' triggers termination."""
+        assert is_termination_intent("Terminate this shell-and-tube design path entirely") is True
+
+    def test_not_viable(self):
+        """Text containing 'not viable' triggers termination."""
+        assert is_termination_intent("This design is not viable for S&T") is True
+
+    def test_recommend_plate(self):
+        """Text containing 'recommend plate' triggers termination."""
+        assert is_termination_intent("Recommend plate exchanger for this duty") is True
+
+    def test_recommend_double_pipe(self):
+        """Text containing 'recommend double-pipe' triggers termination."""
+        assert is_termination_intent("recommend double-pipe exchanger instead") is True
+
+    def test_abort_design(self):
+        """Text containing 'abort design' triggers termination."""
+        assert is_termination_intent("abort design and start over") is True
+
+    def test_no_further_steps(self):
+        """Text containing 'no further steps' triggers termination."""
+        text = "no further steps possible"
+        assert is_termination_intent(text) is True
+
+    def test_case_insensitive(self):
+        """Termination detection is case-insensitive."""
+        assert is_termination_intent("FLAG DESIGN AS IMPRACTICAL") is True
+        assert is_termination_intent("Terminate This Design") is True
+
+    def test_normal_override_not_termination(self):
+        """Normal override text like 'swap fluid' is NOT termination."""
+        assert is_termination_intent("swap fluid allocation") is False
+
+    def test_proceed_not_termination(self):
+        """Text like 'proceed with minimum TEMA' is NOT termination."""
+        assert is_termination_intent("proceed with minimum TEMA shell geometry") is False
+
+    def test_empty_string_not_termination(self):
+        """Empty string is NOT termination."""
+        assert is_termination_intent("") is False
+
+    def test_accept_not_termination(self):
+        """Acceptance phrases are NOT termination."""
+        assert is_termination_intent("yes, go ahead") is False
+        assert is_termination_intent("accept") is False
+
+
+# ===================================================================
+# Phase 5 Tests: Pipeline Termination via Escalation Response
+# ===================================================================
+
+class TestEscalationTerminatesDesign:
+    """User picks a termination option during ESCALATE → pipeline stops."""
+
+    @pytest.mark.asyncio
+    async def test_escalation_response_terminates_pipeline(
+        self, pipeline_runner, mock_sse_manager, mock_session_store, base_state
+    ):
+        """When user responds with 'flag as impractical', pipeline terminates."""
+        # Arrange: step always returns ESCALATE
+        escalate_review = _make_escalate_review(
+            reasoning="Duty too small for S&T — only 292 W",
+            options=[
+                "Flag design as impractical and recommend plate or double-pipe exchanger",
+                "Proceed with minimum TEMA shell geometry",
+            ],
+        )
+        result_escalated = StepResult(
+            step_id=6, step_name="Initial U",
+            outputs={"U_W_m2K": 500},
+            ai_review=escalate_review,
+        )
+        mock_step = MockStep(result_escalated)
+        mock_step.step_id = 6
+        mock_step.step_name = "Initial U"
+
+        passed_vr = _make_validation_result(passed=True)
+
+        # User selects option A: "Flag design as impractical..."
+        def _termination_future(_sid):
+            fut = asyncio.Future()
+            fut.set_result({
+                "type": "override",
+                "values": {
+                    "user_input": "Flag design as impractical and recommend plate or double-pipe exchanger",
+                    "option_index": 0,
+                },
+            })
+            return fut
+
+        mock_sse_manager.create_user_response_future = MagicMock(side_effect=_termination_future)
+
+        with patch(
+            "hx_engine.app.core.pipeline_runner.PIPELINE_STEPS",
+            [lambda: mock_step],
+        ), patch(
+            "hx_engine.app.core.pipeline_runner.check_validation_rules",
+            return_value=passed_vr,
+        ):
+            state = await pipeline_runner.run(base_state)
+
+        # Assert: pipeline terminated, NOT error
+        assert state.pipeline_status == "terminated"
+        assert state.termination_reason is not None
+        assert "Step 6" in state.termination_reason
+
+    @pytest.mark.asyncio
+    async def test_termination_emits_step_error_event(
+        self, pipeline_runner, mock_sse_manager, mock_session_store, base_state
+    ):
+        """Termination emits step_error SSE event with the reason."""
+        escalate_review = _make_escalate_review(
+            reasoning="292 W duty is impractical for S&T",
+            options=["Terminate this design path entirely", "Proceed anyway"],
+        )
+        result_escalated = StepResult(
+            step_id=6, step_name="Initial U",
+            outputs={},
+            ai_review=escalate_review,
+        )
+        mock_step = MockStep(result_escalated)
+        mock_step.step_id = 6
+        mock_step.step_name = "Initial U"
+
+        passed_vr = _make_validation_result(passed=True)
+
+        def _termination_future(_sid):
+            fut = asyncio.Future()
+            fut.set_result({
+                "type": "override",
+                "values": {
+                    "user_input": "Terminate this design path entirely",
+                    "option_index": 0,
+                },
+            })
+            return fut
+
+        mock_sse_manager.create_user_response_future = MagicMock(side_effect=_termination_future)
+
+        with patch(
+            "hx_engine.app.core.pipeline_runner.PIPELINE_STEPS",
+            [lambda: mock_step],
+        ), patch(
+            "hx_engine.app.core.pipeline_runner.check_validation_rules",
+            return_value=passed_vr,
+        ):
+            await pipeline_runner.run(base_state)
+
+        event_types = _get_emitted_event_types(mock_sse_manager)
+        assert "step_error" in event_types
+        # The step_error should contain termination details
+        error_events = [
+            e for e in mock_sse_manager.emitted_events
+            if isinstance(e, dict) and e.get("event_type") == "step_error"
+        ]
+        assert len(error_events) == 1
+        assert "terminated" in error_events[0].get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_non_termination_response_continues_pipeline(
+        self, pipeline_runner, mock_sse_manager, mock_session_store, base_state
+    ):
+        """When user picks a non-termination option, pipeline re-runs the step."""
+        # First call: ESCALATE; second call after user response: PROCEED
+        call_count = 0
+        proceed_review = _make_proceed_review(confidence=0.85)
+        escalate_review = _make_escalate_review(
+            options=["Proceed with minimum geometry", "Swap fluids"],
+        )
+
+        class FlipStep(BaseStep):
+            step_id = 6
+            step_name = "Initial U"
+            ai_mode = AIModeEnum.FULL
+
+            async def execute(self, state):
+                return StepResult(step_id=6, step_name="Initial U", outputs={})
+
+            async def run_with_review_loop(self, state, ai_engineer):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    return StepResult(
+                        step_id=6, step_name="Initial U",
+                        outputs={}, ai_review=escalate_review,
+                    )
+                return StepResult(
+                    step_id=6, step_name="Initial U",
+                    outputs={}, ai_review=proceed_review,
+                )
+
+        passed_vr = _make_validation_result(passed=True)
+
+        def _non_termination_future(_sid):
+            fut = asyncio.Future()
+            fut.set_result({
+                "type": "override",
+                "values": {
+                    "user_input": "Proceed with minimum geometry",
+                    "option_index": 0,
+                },
+            })
+            return fut
+
+        mock_sse_manager.create_user_response_future = MagicMock(
+            side_effect=_non_termination_future,
+        )
+
+        async def _noop_post(state, session_id, step=None):
+            return state
+
+        with patch(
+            "hx_engine.app.core.pipeline_runner.PIPELINE_STEPS",
+            [FlipStep],
+        ), patch(
+            "hx_engine.app.core.pipeline_runner.check_validation_rules",
+            return_value=passed_vr,
+        ), patch.object(
+            pipeline_runner, "_run_convergence_loop", return_value=base_state,
+        ), patch.object(
+            pipeline_runner, "_run_post_convergence_step", side_effect=_noop_post,
+        ):
+            state = await pipeline_runner.run(base_state)
+
+        # Pipeline should NOT be terminated — it should complete
+        assert state.pipeline_status == "completed"
+        assert state.termination_reason is None
+        assert call_count == 2  # step ran twice: escalate then proceed
+
+
+class TestWarningTerminatesDesign:
+    """User picks a termination option during actionable WARNING → pipeline stops."""
+
+    @pytest.mark.asyncio
+    async def test_warning_response_terminates_pipeline(
+        self, pipeline_runner, mock_sse_manager, mock_session_store, base_state
+    ):
+        """When user responds with 'impractical' to a warning, pipeline terminates."""
+        warn_review = AIReview(
+            decision=AIDecisionEnum.WARN,
+            confidence=0.6,
+            reasoning="292 W duty is grossly overdesigned for smallest TEMA shell",
+            options=[
+                "Flag design as impractical and recommend plate exchanger",
+                "Proceed with minimum TEMA shell geometry and document overdesign",
+            ],
+            ai_called=True,
+        )
+        result_warned = StepResult(
+            step_id=6, step_name="Tube Layout",
+            outputs={"U_W_m2K": 500},
+            ai_review=warn_review,
+        )
+        mock_step = MockStep(result_warned)
+        mock_step.step_id = 6
+        mock_step.step_name = "Tube Layout"
+
+        passed_vr = _make_validation_result(passed=True)
+
+        # User selects the impractical option
+        def _termination_future(_sid):
+            fut = asyncio.Future()
+            fut.set_result({
+                "type": "override",
+                "values": {
+                    "user_input": "Flag design as impractical and recommend plate exchanger",
+                    "option_index": 0,
+                },
+            })
+            return fut
+
+        mock_sse_manager.create_user_response_future = MagicMock(side_effect=_termination_future)
+
+        with patch(
+            "hx_engine.app.core.pipeline_runner.PIPELINE_STEPS",
+            [lambda: mock_step],
+        ), patch(
+            "hx_engine.app.core.pipeline_runner.check_validation_rules",
+            return_value=passed_vr,
+        ):
+            state = await pipeline_runner.run(base_state)
+
+        assert state.pipeline_status == "terminated"
+        assert state.termination_reason is not None
+        assert "Step 6" in state.termination_reason
+
+    @pytest.mark.asyncio
+    async def test_warning_non_termination_continues(
+        self, pipeline_runner, mock_sse_manager, mock_session_store, base_state
+    ):
+        """When user picks a non-termination warning option, step re-runs."""
+        call_count = 0
+        proceed_review = _make_proceed_review(confidence=0.85)
+        warn_review = AIReview(
+            decision=AIDecisionEnum.WARN,
+            confidence=0.6,
+            reasoning="Overdesigned but acceptable",
+            options=["Proceed with overdesign noted", "Try smaller geometry"],
+            ai_called=True,
+        )
+
+        class FlipWarnStep(BaseStep):
+            step_id = 6
+            step_name = "Tube Layout"
+            ai_mode = AIModeEnum.FULL
+
+            async def execute(self, state):
+                return StepResult(step_id=6, step_name="Tube Layout", outputs={})
+
+            async def run_with_review_loop(self, state, ai_engineer):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    return StepResult(
+                        step_id=6, step_name="Tube Layout",
+                        outputs={}, ai_review=warn_review,
+                    )
+                return StepResult(
+                    step_id=6, step_name="Tube Layout",
+                    outputs={}, ai_review=proceed_review,
+                )
+
+        passed_vr = _make_validation_result(passed=True)
+
+        def _non_termination_future(_sid):
+            fut = asyncio.Future()
+            fut.set_result({
+                "type": "override",
+                "values": {
+                    "user_input": "Proceed with overdesign noted",
+                    "option_index": 0,
+                },
+            })
+            return fut
+
+        mock_sse_manager.create_user_response_future = MagicMock(
+            side_effect=_non_termination_future,
+        )
+
+        async def _noop_post(state, session_id, step=None):
+            return state
+
+        with patch(
+            "hx_engine.app.core.pipeline_runner.PIPELINE_STEPS",
+            [FlipWarnStep],
+        ), patch(
+            "hx_engine.app.core.pipeline_runner.check_validation_rules",
+            return_value=passed_vr,
+        ), patch.object(
+            pipeline_runner, "_run_convergence_loop", return_value=base_state,
+        ), patch.object(
+            pipeline_runner, "_run_post_convergence_step", side_effect=_noop_post,
+        ):
+            state = await pipeline_runner.run(base_state)
+
+        assert state.pipeline_status == "completed"
+        assert state.termination_reason is None
+        assert call_count == 2
+
+
+class TestDesignStateTerminationField:
+    """Verify the termination_reason field on DesignState."""
+
+    def test_default_termination_reason_is_none(self):
+        """DesignState.termination_reason defaults to None."""
+        state = DesignState(session_id="test-123")
+        assert state.termination_reason is None
+
+    def test_terminated_status_is_valid(self):
+        """'terminated' is an acceptable pipeline_status value."""
+        state = DesignState(session_id="test-123")
+        state.pipeline_status = "terminated"
+        state.termination_reason = "User chose to abandon S&T design"
+        assert state.pipeline_status == "terminated"
+        assert state.termination_reason is not None
+
+
+# ===================================================================
+# Step 7 Auto Geometry-Restart on Velocity Bound Failure
+# ===================================================================
+# Reference: bug_draft_engine_step7_velocity_no_autoiterate.md
+
+from hx_engine.app.core.pipeline_runner import (  # noqa: E402
+    MAX_VELOCITY_RESTARTS,
+    _adjust_n_passes_for_velocity,
+    _is_velocity_bound_error,
+)
+
+
+class TestIsVelocityBoundError:
+    """Pure helper — recognises tube-velocity Layer 2 bound messages."""
+
+    def test_below_minimum_is_velocity_bound(self):
+        assert _is_velocity_bound_error(
+            ["Tube velocity 0.177 m/s below hard minimum 0.3 m/s"]
+        ) is True
+
+    def test_above_maximum_is_velocity_bound(self):
+        assert _is_velocity_bound_error(
+            ["Tube velocity 6.20 m/s above hard maximum 5.0 m/s"]
+        ) is True
+
+    def test_other_step_7_error_is_not_velocity_bound(self):
+        assert _is_velocity_bound_error(
+            ["h_tube must be positive, got -1.00 W/m²K"]
+        ) is False
+
+    def test_empty_errors_is_not_velocity_bound(self):
+        assert _is_velocity_bound_error([]) is False
+
+    def test_case_insensitive(self):
+        assert _is_velocity_bound_error(
+            ["tube velocity 0.122 m/s BELOW HARD MINIMUM 0.3 m/s"]
+        ) is True
+
+
+class TestAdjustNPassesForVelocity:
+    """Pure helper — mutates state.geometry.n_passes for velocity recovery."""
+
+    def _state_with_geometry(self, n_passes: int):
+        from hx_engine.app.models.design_state import GeometrySpec
+        state = DesignState(session_id="t")
+        state.geometry = GeometrySpec(
+            n_tubes=200, n_passes=n_passes,
+            shell_diameter_m=0.5, tube_od_m=0.02, tube_id_m=0.016,
+            tube_length_m=3.0, baffle_spacing_m=0.2,
+            pitch_ratio=1.25, baffle_cut=0.25,
+        )
+        return state
+
+    def test_velocity_low_doubles_n_passes(self):
+        state = self._state_with_geometry(n_passes=2)
+        out = _adjust_n_passes_for_velocity(
+            state, ["Tube velocity 0.177 m/s below hard minimum 0.3 m/s"],
+        )
+        assert out == (2, 4, "increase")
+        assert state.geometry.n_passes == 4
+
+    def test_velocity_low_caps_at_8(self):
+        state = self._state_with_geometry(n_passes=6)
+        out = _adjust_n_passes_for_velocity(
+            state, ["Tube velocity 0.10 m/s below hard minimum 0.3 m/s"],
+        )
+        assert out == (6, 8, "increase")
+        assert state.geometry.n_passes == 8
+
+    def test_velocity_low_at_cap_returns_none(self):
+        state = self._state_with_geometry(n_passes=8)
+        out = _adjust_n_passes_for_velocity(
+            state, ["Tube velocity 0.10 m/s below hard minimum 0.3 m/s"],
+        )
+        assert out is None
+        assert state.geometry.n_passes == 8
+
+    def test_velocity_high_halves_n_passes(self):
+        state = self._state_with_geometry(n_passes=4)
+        out = _adjust_n_passes_for_velocity(
+            state, ["Tube velocity 6.20 m/s above hard maximum 5.0 m/s"],
+        )
+        assert out == (4, 2, "decrease")
+        assert state.geometry.n_passes == 2
+
+    def test_velocity_high_at_floor_returns_none(self):
+        state = self._state_with_geometry(n_passes=1)
+        out = _adjust_n_passes_for_velocity(
+            state, ["Tube velocity 6.20 m/s above hard maximum 5.0 m/s"],
+        )
+        assert out is None
+        assert state.geometry.n_passes == 1
+
+    def test_no_geometry_returns_none(self):
+        state = DesignState(session_id="t")
+        out = _adjust_n_passes_for_velocity(
+            state, ["Tube velocity 0.10 m/s below hard minimum 0.3 m/s"],
+        )
+        assert out is None
+
+    def test_unrelated_error_returns_none(self):
+        state = self._state_with_geometry(n_passes=2)
+        out = _adjust_n_passes_for_velocity(
+            state, ["h_tube must be positive, got -1.00 W/m²K"],
+        )
+        assert out is None
+        assert state.geometry.n_passes == 2
+
+
+class TestStep7AutoVelocityRestart:
+    """Integration — Step 7 Layer 2 velocity failure triggers Steps 5–6 restart."""
+
+    @pytest.mark.asyncio
+    async def test_auto_restart_increments_n_passes_and_re_runs_steps_5_6(
+        self, pipeline_runner, mock_sse_manager, mock_session_store, base_state,
+    ):
+        """When Step 7 Layer 2 fails on tube velocity and geometry exists,
+        the pipeline doubles n_passes, re-runs Steps 5+6, and re-runs Step 7
+        — without immediately escalating to the user.
+        """
+        from hx_engine.app.models.design_state import GeometrySpec
+
+        # Seed state with a geometry so the auto-restart path is taken.
+        base_state.geometry = GeometrySpec(
+            n_tubes=200, n_passes=2,
+            shell_diameter_m=0.5, tube_od_m=0.02, tube_id_m=0.016,
+            tube_length_m=3.0, baffle_spacing_m=0.2,
+            pitch_ratio=1.25, baffle_cut=0.25,
+        )
+
+        # Step 7 always fails Layer 2 with a velocity error.
+        result_velocity_low = StepResult(
+            step_id=7,
+            step_name="Tube-Side H",
+            outputs={"tube_velocity_m_s": 0.177, "h_tube_W_m2K": 500.0},
+            ai_review=None,
+        )
+        mock_step = MockStep(result_velocity_low)
+
+        failed_vr = _make_validation_result(
+            passed=False,
+            errors=["Tube velocity 0.177 m/s below hard minimum 0.3 m/s"],
+        )
+
+        # Stub Step 5 / Step 6 re-runs so the inline restart succeeds without
+        # touching real correlations.
+        async def _noop_run(self, state, ai_engineer):
+            return StepResult(
+                step_id=self.step_id,
+                step_name=self.step_name,
+                outputs={},
+                ai_review=None,
+            )
+
+        # Each user-response future call returns a "skip" so the eventual
+        # escalation (after restarts exhaust) closes cleanly.
+        def _fresh_future(_session_id):
+            fut = asyncio.Future()
+            fut.set_result({"type": "skip", "values": {}})
+            return fut
+
+        mock_sse_manager.create_user_response_future = MagicMock(
+            side_effect=_fresh_future,
+        )
+
+        from hx_engine.app.steps.step_05_lmtd import Step05LMTD
+        from hx_engine.app.steps.step_06_initial_u import Step06InitialU
+
+        with patch(
+            "hx_engine.app.core.pipeline_runner.PIPELINE_STEPS",
+            [lambda: mock_step],
+        ), patch(
+            "hx_engine.app.core.pipeline_runner.check_validation_rules",
+            return_value=failed_vr,
+        ), patch.object(
+            Step05LMTD, "run_with_review_loop", _noop_run,
+        ), patch.object(
+            Step06InitialU, "run_with_review_loop", _noop_run,
+        ):
+            await pipeline_runner.run(base_state)
+
+        # n_passes doubled MAX_VELOCITY_RESTARTS times: 2 → 4 → 8 (then capped).
+        assert base_state.geometry.n_passes == 8, (
+            f"Expected n_passes to climb to 8 across {MAX_VELOCITY_RESTARTS} "
+            f"auto-restarts, got {base_state.geometry.n_passes}"
+        )
+        # An auto-restart note is recorded for each successful adjustment.
+        restart_notes = [n for n in base_state.notes if "auto-restart" in n]
+        assert len(restart_notes) >= 2, (
+            f"Expected at least 2 auto-restart notes, got {restart_notes}"
+        )
+        # Step 5 and Step 6 were re-emitted via step_started events.
+        started_step_ids = [
+            e.get("step_id") for e in mock_sse_manager.emitted_events
+            if isinstance(e, dict) and e.get("event_type") == "step_started"
+        ]
+        assert 5 in started_step_ids, (
+            f"Step 5 should re-run during velocity auto-restart; "
+            f"started ids: {started_step_ids}"
+        )
+        assert 6 in started_step_ids, (
+            f"Step 6 should re-run during velocity auto-restart; "
+            f"started ids: {started_step_ids}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_geometry_skips_auto_restart_and_falls_through(
+        self, pipeline_runner, mock_sse_manager, mock_session_store, base_state,
+    ):
+        """No geometry → auto-restart skipped, existing AI recovery path runs."""
+        # base_state has no geometry — guard should skip auto-restart entirely.
+        result_velocity_low = StepResult(
+            step_id=7,
+            step_name="Tube-Side H",
+            outputs={"tube_velocity_m_s": 0.177},
+            ai_review=None,
+        )
+        mock_step = MockStep(result_velocity_low)
+
+        failed_vr = _make_validation_result(
+            passed=False,
+            errors=["Tube velocity 0.177 m/s below hard minimum 0.3 m/s"],
+        )
+
+        def _fresh_future(_session_id):
+            fut = asyncio.Future()
+            fut.set_result({"type": "skip", "values": {}})
+            return fut
+
+        mock_sse_manager.create_user_response_future = MagicMock(
+            side_effect=_fresh_future,
+        )
+
+        with patch(
+            "hx_engine.app.core.pipeline_runner.PIPELINE_STEPS",
+            [lambda: mock_step],
+        ), patch(
+            "hx_engine.app.core.pipeline_runner.check_validation_rules",
+            return_value=failed_vr,
+        ):
+            await pipeline_runner.run(base_state)
+
+        # No step_started events for Steps 5 or 6 — auto-restart was skipped.
+        started_step_ids = [
+            e.get("step_id") for e in mock_sse_manager.emitted_events
+            if isinstance(e, dict) and e.get("event_type") == "step_started"
+        ]
+        assert 5 not in started_step_ids
+        assert 6 not in started_step_ids
+        # No auto-restart notes recorded.
+        assert not any("auto-restart" in n for n in base_state.notes)
+
+
+
+# ===================================================================
+# Step 10 mechanical-design Layer 2 -> RedesignDriver routing
+# Reference: artifacts/bugs/bug_draft_engine_escalation_user_facing_failure.md
+# ===================================================================
+
+from hx_engine.app.core.exceptions import DesignConstraintViolation
+from hx_engine.app.core.pipeline_runner import _classify_step10_mechanical_failure
+
+
+class TestClassifyStep10MechanicalFailure:
+    """Classifier returns a DesignConstraintViolation for dP / nozzle rho_v2 rules."""
+
+    def test_tube_dp_over_limit_classified(self):
+        v = _classify_step10_mechanical_failure(
+            10, ["Tube-side \u0394P 77758 Pa exceeds 0.7 bar (70000 Pa) limit"],
+        )
+        assert v is not None
+        assert v.constraint == "tube_dp_max"
+        assert v.step_id == 10
+        legal = {
+            "n_passes", "tube_length_m", "tube_od_m", "pitch_layout",
+            "baffle_cut", "baffle_spacing_m", "n_shells", "shell_passes",
+            "multi_shell_arrangement",
+        }
+        for lever in v.suggested_levers:
+            assert lever in legal
+
+    def test_shell_dp_over_limit_classified(self):
+        v = _classify_step10_mechanical_failure(
+            10, ["Shell-side \u0394P 165000 Pa exceeds 1.4 bar (140000 Pa) limit"],
+        )
+        assert v is not None
+        assert v.constraint == "shell_dp_max"
+
+    def test_nozzle_rho_v2_over_limit_classified(self):
+        v = _classify_step10_mechanical_failure(
+            10,
+            [
+                "Tube-side nozzle \u03c1v\u00b2 2500 kg/m\u00b7s\u00b2 exceeds "
+                "TEMA erosion limit (2230 kg/m\u00b7s\u00b2); auto-correction "
+                "was not applied"
+            ],
+        )
+        assert v is not None
+        assert v.constraint == "nozzle_rho_v2_max"
+
+    def test_unknown_step10_error_not_classified(self):
+        # Layer 1 contract issues (missing outputs) must NOT route to redesign
+        # -- they are real bugs, not mechanical-design infeasibilities.
+        v = _classify_step10_mechanical_failure(
+            10, ["dP_tube_Pa is missing from Step 10 outputs"],
+        )
+        assert v is None
+
+    def test_non_step10_never_classified(self):
+        v = _classify_step10_mechanical_failure(
+            7, ["Tube-side \u0394P exceeds 0.7 bar"],
+        )
+        assert v is None
+
+    def test_empty_errors_returns_none(self):
+        assert _classify_step10_mechanical_failure(10, []) is None
+
+
+class TestStep10MechanicalLayer2RoutesToRedesign:
+    """Step 10 dP / nozzle rho_v2 Layer 2 failures must raise DesignConstraintViolation."""
+
+    @pytest.mark.asyncio
+    async def test_step10_dp_layer2_failure_raises_violation_not_step_error(
+        self, pipeline_runner, mock_sse_manager, base_state,
+    ):
+        """The pipeline runner must hand off Step 10 dP failures to the
+        outer RedesignDriver rather than emitting a user-facing step_error.
+        """
+        clean_review = _make_proceed_review()
+        step10_result = StepResult(
+            step_id=10,
+            step_name="Pressure Drops",
+            outputs={"dP_tube_Pa": 77758.0, "dP_shell_Pa": 50000.0},
+            ai_review=clean_review,
+        )
+
+        class _MockStep10(MockStep):
+            step_id = 10
+            step_name = "Pressure Drops"
+
+        mock_step = _MockStep10(step10_result)
+        failed_vr = _make_validation_result(
+            passed=False,
+            errors=["Tube-side \u0394P 77758 Pa exceeds 0.7 bar (70000 Pa) limit"],
+        )
+
+        with patch(
+            "hx_engine.app.core.pipeline_runner.PIPELINE_STEPS",
+            [lambda: mock_step],
+        ), patch(
+            "hx_engine.app.core.pipeline_runner.check_validation_rules",
+            return_value=failed_vr,
+        ):
+            with pytest.raises(DesignConstraintViolation) as exc_info:
+                await pipeline_runner.run(base_state)
+
+        assert exc_info.value.step_id == 10
+        assert exc_info.value.constraint == "tube_dp_max"
+        assert exc_info.value.suggested_levers  # non-empty
+
+        # Critically: NO user-facing step_error event was emitted, and NO raw
+        # "max escalation attempts (N) reached" wording leaked to the client.
+        for ev in mock_sse_manager.emitted_events:
+            if not isinstance(ev, dict):
+                continue
+            assert ev.get("event_type") != "step_error"
+            assert "max escalation" not in str(ev).lower()
+
+
+# ===================================================================
+# Step 11 negative-overdesign Layer 2 -> RedesignDriver routing
+# Reference: artifacts/bugs/bug_ea9abc9b_xstack_step11_undersized_no_redesign_loop.md
+# ===================================================================
+
+from hx_engine.app.core.pipeline_runner import (
+    _classify_redesignable_layer2_failure,
+    _classify_step11_overdesign_failure,
+)
+
+
+class TestClassifyStep11OverdesignFailure:
+    """Classifier returns a DesignConstraintViolation for negative overdesign."""
+
+    def test_negative_overdesign_classified(self):
+        v = _classify_step11_overdesign_failure(
+            11,
+            ["Overdesign is -54.2% \u2014 exchanger is undersized. "
+             "Need more area or higher U."],
+        )
+        assert v is not None
+        assert v.step_id == 11
+        assert v.constraint == "overdesign_negative"
+        # Suggested levers must be a subset of the canonical legal set so
+        # the RedesignDriver can apply them.
+        legal = {
+            "n_passes", "tube_length_m", "tube_od_m", "pitch_layout",
+            "baffle_cut", "baffle_spacing_m", "n_shells", "shell_passes",
+            "multi_shell_arrangement",
+        }
+        assert v.suggested_levers
+        for lever in v.suggested_levers:
+            assert lever in legal
+
+    def test_missing_output_not_classified(self):
+        # Layer 1 contract issue must NOT route to redesign.
+        v = _classify_step11_overdesign_failure(
+            11, ["overdesign_pct is missing from Step 11 outputs"],
+        )
+        assert v is None
+
+    def test_fouling_paradox_not_classified(self):
+        # The fouling-paradox ESCALATE rule (R4) is engineer-facing, not
+        # redesign-routable.
+        v = _classify_step11_overdesign_failure(
+            11,
+            ["Low-velocity fouling paradox requires intervention: "
+             "overdesign=120.0% \u2014 excess area reduces tube velocity..."],
+        )
+        assert v is None
+
+    def test_non_step11_never_classified(self):
+        v = _classify_step11_overdesign_failure(
+            10, ["Overdesign is -54.2% \u2014 exchanger is undersized."],
+        )
+        assert v is None
+
+    def test_empty_errors_returns_none(self):
+        assert _classify_step11_overdesign_failure(11, []) is None
+
+    def test_combined_classifier_routes_step10_and_step11(self):
+        """The combined wrapper must catch both Step 10 mechanical and
+        Step 11 overdesign failures."""
+        s10 = _classify_redesignable_layer2_failure(
+            10, ["Tube-side \u0394P 77758 Pa exceeds 0.7 bar (70000 Pa) limit"],
+        )
+        assert s10 is not None
+        assert s10.constraint == "tube_dp_max"
+
+        s11 = _classify_redesignable_layer2_failure(
+            11, ["Overdesign is -54.2% \u2014 exchanger is undersized."],
+        )
+        assert s11 is not None
+        assert s11.constraint == "overdesign_negative"
+
+
+class TestStep11OverdesignLayer2RoutesToRedesign:
+    """Step 11 negative-overdesign Layer 2 failures must raise
+    DesignConstraintViolation rather than emit a user-facing step_error
+    or stall the pipeline silently."""
+
+    @pytest.mark.asyncio
+    async def test_step11_negative_overdesign_raises_violation_not_step_error(
+        self, pipeline_runner, mock_sse_manager, base_state,
+    ):
+        clean_review = _make_proceed_review()
+        step11_result = StepResult(
+            step_id=11,
+            step_name="Area & Overdesign",
+            outputs={
+                "area_required_m2": 479.0,
+                "area_provided_m2": 219.49,
+                "overdesign_pct": -54.2,
+            },
+            ai_review=clean_review,
+        )
+
+        class _MockStep11(MockStep):
+            step_id = 11
+            step_name = "Area & Overdesign"
+
+        mock_step = _MockStep11(step11_result)
+        failed_vr = _make_validation_result(
+            passed=False,
+            errors=[
+                "Overdesign is -54.2% \u2014 exchanger is undersized. "
+                "Need more area or higher U."
+            ],
+        )
+
+        with patch(
+            "hx_engine.app.core.pipeline_runner.PIPELINE_STEPS",
+            [lambda: mock_step],
+        ), patch(
+            "hx_engine.app.core.pipeline_runner.check_validation_rules",
+            return_value=failed_vr,
+        ):
+            with pytest.raises(DesignConstraintViolation) as exc_info:
+                await pipeline_runner.run(base_state)
+
+        assert exc_info.value.step_id == 11
+        assert exc_info.value.constraint == "overdesign_negative"
+        assert exc_info.value.suggested_levers  # non-empty
+
+        # No silent-stall, no user-facing step_error event.
+        for ev in mock_sse_manager.emitted_events:
+            if not isinstance(ev, dict):
+                continue
+            assert ev.get("event_type") != "step_error"
+
+
+class TestMaxEscalationsConfigurable:
+    """The per-step escalation budget must be configurable, not a literal 2."""
+
+    def test_default_max_escalations_comes_from_settings(
+        self, mock_session_store, mock_sse_manager, mock_ai_engineer,
+    ):
+        from hx_engine.app.config import settings as _s
+
+        runner = PipelineRunner(
+            session_store=mock_session_store,
+            sse_manager=mock_sse_manager,
+            ai_engineer=mock_ai_engineer,
+        )
+        assert runner.max_escalations == _s.max_internal_escalations
+        # The default must be greater than 2 -- the bug requires the AI to
+        # have more autonomous room before any user-facing pause.
+        assert runner.max_escalations > 2
+
+    def test_explicit_max_escalations_override(
+        self, mock_session_store, mock_sse_manager, mock_ai_engineer,
+    ):
+        runner = PipelineRunner(
+            session_store=mock_session_store,
+            sse_manager=mock_sse_manager,
+            ai_engineer=mock_ai_engineer,
+            max_escalations=7,
+        )
+        assert runner.max_escalations == 7
