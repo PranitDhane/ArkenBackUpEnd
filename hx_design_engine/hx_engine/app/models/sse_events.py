@@ -1,0 +1,155 @@
+"""Server-Sent Event models for the HX design pipeline.
+
+These match the frontend HX_EVENT_TYPES constants exactly.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Optional
+
+from pydantic import BaseModel, Field
+
+
+# ---------------------------------------------------------------------------
+# SSE event types — must match frontend HX_EVENT_TYPES
+# ---------------------------------------------------------------------------
+
+class SSEBaseEvent(BaseModel):
+    """Base for all SSE events."""
+
+    session_id: str
+    event_type: str
+
+
+class StepStartedEvent(SSEBaseEvent):
+    event_type: str = "step_started"
+    step_id: int
+    step_name: str
+
+
+class IterationProgressEvent(SSEBaseEvent):
+    event_type: str = "iteration_progress"
+    iteration_number: int
+    max_iterations: int = 20
+    current_U: Optional[float] = None
+    delta_U_pct: Optional[float] = None
+    constraints_met: bool = False
+    overdesign_pct: Optional[float] = None
+    dP_tube_pct_of_limit: Optional[float] = None
+    dP_shell_pct_of_limit: Optional[float] = None
+    velocity_m_s: Optional[float] = None
+    adjustment_made: Optional[str] = None
+
+
+class StepApprovedEvent(SSEBaseEvent):
+    event_type: str = "step_approved"
+    step_id: int
+    step_name: str
+    confidence: float = 0.0
+    reasoning: str = ""
+    user_summary: str = ""
+    duration_ms: int = 0
+    outputs: dict[str, Any] = Field(default_factory=dict)
+
+
+class StepErrorEvent(SSEBaseEvent):
+    event_type: str = "step_error"
+    step_id: int
+    step_name: str
+    message: str = ""
+    observation: Optional[str] = None
+    recommendation: Optional[str] = None
+    options: Optional[list[str]] = None
+
+
+class StepEscalatedEvent(SSEBaseEvent):
+    event_type: str = "step_escalated"
+    step_id: int
+    step_name: str
+    message: str = ""
+    options: list[str] = Field(default_factory=list)
+    option_ratings: list[int] = Field(default_factory=list)
+    recommendation: Optional[str] = None
+    # EPIC-XSTACK-2026-007-S1: property-request escalation extras
+    event_subtype: Optional[str] = None               # "property_request" | "ai_property_suggestion" | None
+    property_request_payload: Optional[dict] = None   # structured AI estimate + metadata for PropertyRequestCard
+    # EPIC-XSTACK-2026-007-S2: AI property suggestion transparency fields
+    reason: Optional[str] = None               # why the AI is suggesting this value
+    engineering_impact: Optional[str] = None   # what is affected by this property
+    proposed_value: Optional[float] = None     # AI-suggested value
+    current_value: Optional[float] = None      # current value in use
+
+
+class StepCorrectedEvent(SSEBaseEvent):
+    event_type: str = "step_corrected"
+    step_id: int
+    step_name: str = ""
+    confidence: float = 0.0
+    reasoning: str = ""
+    user_summary: str = ""
+    correction: dict[str, Any] = Field(default_factory=dict)
+    before: dict[str, Any] = Field(default_factory=dict)
+    after: dict[str, Any] = Field(default_factory=dict)
+    duration_ms: int = 0
+    outputs: dict[str, Any] = Field(default_factory=dict)
+
+
+class StepWarningEvent(SSEBaseEvent):
+    event_type: str = "step_warning"
+    step_id: int
+    step_name: str = ""
+    confidence: float = 0.0
+    reasoning: str = ""
+    user_summary: str = ""
+    warning_message: str = ""
+    severity: str = "warning"  # "warning" = actionable | "note" = informational
+    duration_ms: int = 0
+    outputs: dict[str, Any] = Field(default_factory=dict)
+    options: list[str] = Field(default_factory=list)
+    option_ratings: list[int] = Field(default_factory=list)
+    recommendation: Optional[str] = None
+
+
+class DesignCompleteEvent(SSEBaseEvent):
+    event_type: str = "design_complete"
+    summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class RedesignAttemptEvent(SSEBaseEvent):
+    """Emitted by the redesign driver each time a constraint violation
+    triggers a lever change + pipeline restart.
+
+    The frontend renders these as a per-attempt timeline in the run view
+    (one row per attempt: which constraint failed, which lever was tweaked
+    and in which direction, whether AI or the deterministic fallback chose
+    it, and the final outcome of the resulting pipeline run).
+    """
+
+    event_type: str = "redesign_attempt"
+    attempt_number: int
+    max_attempts: int
+    failed_step_id: int
+    constraint: str = ""
+    failure_message: str = ""
+    lever: str = ""
+    old_value: Any = None
+    new_value: Any = None
+    direction: str = ""
+    rationale: str = ""
+    ai_called: bool = False
+    fallback_used: bool = False
+    outcome: str = "in_progress"   # "in_progress" | "succeeded" | "failed" | "violation"
+
+
+# All 9 SSE event types for contract testing
+SSE_EVENT_TYPES = [
+    "step_started",
+    "step_approved",
+    "step_corrected",
+    "step_warning",
+    "step_escalated",
+    "step_error",
+    "iteration_progress",
+    "design_complete",
+    "redesign_attempt",
+]

@@ -1,0 +1,204 @@
+@import "tailwindcss";
+
+/* ============================================
+   CSS Variables — Engineering Terminal Theme
+   ============================================ */
+:root {
+  /* Backgrounds */
+  --color-bg:               #0f1117;
+  --color-surface:          #1a1d27;
+  --color-surface-elevated: #21253300;
+
+  /* Borders */
+  --color-border:           #2a2d3a;
+  --color-border-focus:     #3b82f6;
+
+  /* Text */
+  --color-text-primary:     #e8eaf0;
+  --color-text-secondary:   #9ca3af;
+  --color-text-muted:       #6b7280;
+
+  /* Status — step card states */
+  --color-approved:         #22c55e;   /* green-500  */
+  --color-corrected:        #f59e0b;   /* amber-500  */
+  --color-warning:          #eab308;   /* yellow-500 */
+  --color-escalated:        #f97316;   /* orange-500 */
+  --color-error:            #ef4444;   /* red-500    */
+  --color-running:          #3b82f6;   /* blue-500   */
+
+  /* Chat accent lines */
+  --color-user-accent:      #f59e0b;   /* amber — user message border */
+  --color-ai-accent:        #3b82f6;   /* blue  — AI message border   */
+
+  /* Typography */
+  --font-ui:   'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+
+/* ============================================
+   Homepage Light Theme Tokens
+   (Scoped to .homepage — overrides dark :root)
+   ============================================ */
+.homepage {
+  --hp-bg:              #f8f9fb;
+  --hp-bg-alt:          #f1f3f7;
+  --hp-surface:         #ffffff;
+  --hp-text:            #0f1117;
+  --hp-muted:           #6b7280;
+  --hp-subtle:          #9ca3af;
+  --hp-border:          #e5e7eb;
+  --hp-accent:          #f59e0b;
+  --hp-accent-blue:     #3b82f6;
+  --hp-success:         #22c55e;
+  --hp-terminal-bg:     #1a1d27;
+  --hp-terminal-border: #2a2d3a;
+  --hp-terminal-dim:    #4b5563;
+  --font-display:       'DM Serif Display', Georgia, serif;
+}
+
+/* ============================================
+   Base Styles
+   ============================================ */
+html {
+  font-family: var(--font-ui);
+  color-scheme: dark;
+}
+
+body {
+  background-color: var(--color-bg);
+  color: var(--color-text-primary);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Engineering data values — use on all numbers/units */
+.data-value {
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+/* ============================================
+   Custom Scrollbar (dark)
+   ============================================ */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: var(--color-border);
+  border-radius: 2px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: #3a3d4a;
+}
+
+/* ============================================
+   Focus Ring
+   ============================================ */
+:focus-visible {
+  outline: 1px solid var(--color-border-focus);
+  outline-offset: 2px;
+}
+
+/* ============================================
+   Resize Handle (split panel)
+   ============================================ */
+.resize-handle {
+  background-color: var(--color-border);
+  transition: background-color 150ms ease;
+  cursor: col-resize;
+}
+
+.resize-handle:hover,
+.resize-handle:active {
+  background-color: var(--color-running);
+}
+
+/* ============================================
+   Step Card Animations
+   ============================================ */
+@keyframes stepIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position:  200% 0; }
+}
+
+.animate-step-in {
+  animation: stepIn 250ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-spin-slow {
+  animation: spin 1.2s linear infinite;
+}
+
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--color-surface) 25%,
+    #2a2d3a 50%,
+    var(--color-surface) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+}
+
+/* ============================================
+   Progress Bar
+   ============================================ */
+@keyframes progressStripe {
+  from { background-position: 0 0; }
+  to   { background-position: 28px 0; }
+}
+
+.progress-bar-active {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    transparent,
+    transparent 5px,
+    rgba(255,255,255,0.04) 5px,
+    rgba(255,255,255,0.04) 10px
+  );
+  animation: progressStripe 600ms linear infinite;
+}
+
+/* ============================================
+   Reduced Motion
+   ============================================ */
+@media (prefers-reduced-motion: reduce) {
+  .animate-step-in,
+  .animate-spin-slow,
+  .shimmer,
+  .progress-bar-active {
+    animation: none;
+  }
+
+  .resize-handle,
+  * {
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ============================================
+   Toaster override (dark theme)
+   ============================================ */
+.react-hot-toast > div {
+  background: var(--color-surface) !important;
+  color: var(--color-text-primary) !important;
+  border: 1px solid var(--color-border) !important;
+}

@@ -1,0 +1,251 @@
+"""Tests for Piece 1: DesignState, FluidProperties, GeometrySpec."""
+
+import pytest
+from pydantic import ValidationError
+
+from hx_engine.app.models.design_state import (
+    DesignState,
+    FluidProperties,
+    GeometrySpec,
+)
+
+
+# ===== GeometrySpec CG3A tests =====
+
+class TestGeometrySpec:
+
+    def test_baffle_spacing_valid(self):
+        g = GeometrySpec(baffle_spacing_m=0.127)
+        assert g.baffle_spacing_m == 0.127
+
+    def test_baffle_spacing_below_min(self):
+        with pytest.raises(ValidationError, match="baffle_spacing_m"):
+            GeometrySpec(baffle_spacing_m=0.02)
+
+    def test_baffle_spacing_above_max(self):
+        with pytest.raises(ValidationError, match="baffle_spacing_m"):
+            GeometrySpec(baffle_spacing_m=3.0)
+
+    def test_baffle_spacing_none_accepted(self):
+        g = GeometrySpec(baffle_spacing_m=None)
+        assert g.baffle_spacing_m is None
+
+    def test_pitch_ratio_valid(self):
+        g = GeometrySpec(pitch_ratio=1.333)
+        assert g.pitch_ratio == 1.333
+
+    def test_pitch_ratio_below_min(self):
+        with pytest.raises(ValidationError, match="pitch_ratio"):
+            GeometrySpec(pitch_ratio=1.1)
+
+    def test_pitch_ratio_above_max(self):
+        with pytest.raises(ValidationError, match="pitch_ratio"):
+            GeometrySpec(pitch_ratio=1.6)
+
+    def test_shell_diameter_valid(self):
+        g = GeometrySpec(shell_diameter_m=0.59)
+        assert g.shell_diameter_m == 0.59
+
+    def test_shell_diameter_below_min(self):
+        with pytest.raises(ValidationError, match="shell_diameter_m"):
+            GeometrySpec(shell_diameter_m=0.01)
+
+    def test_tube_od_valid(self):
+        g = GeometrySpec(tube_od_m=0.019)
+        assert g.tube_od_m == 0.019
+
+    def test_tube_od_below_min(self):
+        with pytest.raises(ValidationError, match="tube_od_m"):
+            GeometrySpec(tube_od_m=0.001)
+
+    def test_baffle_cut_valid(self):
+        g = GeometrySpec(baffle_cut=0.25)
+        assert g.baffle_cut == 0.25
+
+    def test_baffle_cut_below_min(self):
+        with pytest.raises(ValidationError, match="baffle_cut"):
+            GeometrySpec(baffle_cut=0.10)
+
+    def test_baffle_cut_above_max(self):
+        with pytest.raises(ValidationError, match="baffle_cut"):
+            GeometrySpec(baffle_cut=0.50)
+
+    def test_tube_id_less_than_od(self):
+        g = GeometrySpec(tube_od_m=0.019, tube_id_m=0.015)
+        assert g.tube_id_m < g.tube_od_m
+
+    def test_tube_id_ge_od_rejected(self):
+        with pytest.raises(ValidationError, match="tube_id_m"):
+            GeometrySpec(tube_od_m=0.019, tube_id_m=0.020)
+
+
+# ===== FluidProperties tests =====
+
+class TestFluidProperties:
+
+    def test_valid_properties(self):
+        fp = FluidProperties(
+            density_kg_m3=998.0,
+            viscosity_Pa_s=0.001,
+            cp_J_kgK=4181.0,
+            k_W_mK=0.6,
+            Pr=7.0,
+        )
+        assert fp.density_kg_m3 == 998.0
+
+    def test_negative_density_rejected(self):
+        with pytest.raises(ValidationError, match="density_kg_m3"):
+            FluidProperties(density_kg_m3=-100)
+
+    def test_density_below_range(self):
+        with pytest.raises(ValidationError, match="density_kg_m3"):
+            FluidProperties(density_kg_m3=0.001)
+
+    def test_viscosity_above_range(self):
+        with pytest.raises(ValidationError, match="viscosity_Pa_s"):
+            FluidProperties(viscosity_Pa_s=5.0)
+
+    def test_all_none_accepted(self):
+        fp = FluidProperties()
+        assert fp.density_kg_m3 is None
+
+
+# ===== DesignState tests =====
+
+class TestDesignState:
+
+    def test_session_id_auto_generated(self):
+        s = DesignState()
+        assert s.session_id  # non-empty UUID string
+        assert len(s.session_id) == 36  # UUID4 format
+
+    def test_default_factory_isolation(self):
+        s1 = DesignState()
+        s2 = DesignState()
+        assert s1.step_records is not s2.step_records
+        assert s1.warnings is not s2.warnings
+        assert s1.completed_steps is not s2.completed_steps
+
+    def test_round_trip_json(self):
+        s = DesignState(
+            raw_request="test",
+            T_hot_in_C=150.0,
+            T_hot_out_C=90.0,
+            T_cold_in_C=30.0,
+            m_dot_hot_kg_s=50.0,
+            hot_fluid_name="crude oil",
+            cold_fluid_name="water",
+        )
+        json_str = s.model_dump_json()
+        s2 = DesignState.model_validate_json(json_str)
+        assert s2.T_hot_in_C == 150.0
+        assert s2.hot_fluid_name == "crude oil"
+        assert s2.session_id == s.session_id
+
+    def test_shell_id_finalised_defaults_false(self):
+        s = DesignState()
+        assert s.shell_id_finalised is False
+
+    def test_shell_id_finalised_round_trip(self):
+        s = DesignState(shell_id_finalised=True)
+        assert s.shell_id_finalised is True
+        s2 = DesignState.model_validate_json(s.model_dump_json())
+        assert s2.shell_id_finalised is True
+
+    def test_area_uncertainty_fields_default_none(self):
+        s = DesignState()
+        assert s.A_required_low_m2 is None
+        assert s.A_required_high_m2 is None
+
+    def test_design_strengths_risks_default_empty(self):
+        s = DesignState()
+        assert s.design_strengths == []
+        assert s.design_risks == []
+
+
+# ---------------------------------------------------------------------------
+# EPIC-XSTACK-2026-007-S2: user-provided property fields
+# ---------------------------------------------------------------------------
+
+class TestDesignStateUserProvided:
+    """Tests for user_provided_hot_props / cold_props / temp fields added in Slice 2."""
+
+    def test_user_provided_hot_props_defaults_none(self):
+        s = DesignState()
+        assert s.user_provided_hot_props is None
+
+    def test_user_provided_cold_props_defaults_none(self):
+        s = DesignState()
+        assert s.user_provided_cold_props is None
+
+    def test_user_property_temp_hot_C_defaults_none(self):
+        s = DesignState()
+        assert s.user_property_temp_hot_C is None
+
+    def test_user_property_temp_cold_C_defaults_none(self):
+        s = DesignState()
+        assert s.user_property_temp_cold_C is None
+
+    def test_assign_user_provided_hot_props(self):
+        s = DesignState()
+        fp = FluidProperties(
+            density_kg_m3=850.0,
+            viscosity_Pa_s=0.002,
+            property_source="user_provided",
+        )
+        s.user_provided_hot_props = fp
+        assert s.user_provided_hot_props.density_kg_m3 == pytest.approx(850.0)
+        assert s.user_provided_hot_props.property_source == "user_provided"
+
+    def test_assign_user_provided_cold_props(self):
+        s = DesignState()
+        fp = FluidProperties(density_kg_m3=920.0, property_source="user_provided")
+        s.user_provided_cold_props = fp
+        assert s.user_provided_cold_props.density_kg_m3 == pytest.approx(920.0)
+
+    def test_user_property_temps_assignable(self):
+        s = DesignState()
+        s.user_property_temp_hot_C = 120.0
+        s.user_property_temp_cold_C = 45.0
+        assert s.user_property_temp_hot_C == pytest.approx(120.0)
+        assert s.user_property_temp_cold_C == pytest.approx(45.0)
+
+    def test_user_provided_props_round_trip_json(self):
+        fp = FluidProperties(
+            density_kg_m3=860.0,
+            viscosity_Pa_s=0.003,
+            cp_J_kgK=2050.0,
+            k_W_mK=0.13,
+            property_source="user_provided",
+        )
+        s = DesignState(
+            user_provided_hot_props=fp,
+            user_property_temp_hot_C=120.0,
+        )
+        json_str = s.model_dump_json()
+        s2 = DesignState.model_validate_json(json_str)
+
+        assert s2.user_provided_hot_props is not None
+        assert s2.user_provided_hot_props.density_kg_m3 == pytest.approx(860.0)
+        assert s2.user_provided_hot_props.property_source == "user_provided"
+        assert s2.user_property_temp_hot_C == pytest.approx(120.0)
+        assert s2.user_provided_cold_props is None
+
+
+class TestDesignStatePropertyProvenance:
+    """Tests for property_provenance field added in Slice 3."""
+
+    def test_property_provenance_defaults_none(self):
+        s = DesignState()
+        assert s.property_provenance is None
+
+    def test_property_provenance_can_be_set(self):
+        s = DesignState()
+        provenance = {
+            "hot_fluid": {"fluid_name": "Steam", "source": "iapws", "label": "IAPWS-IF97 Reference", "confidence": None, "properties": {}},
+            "cold_fluid": {"fluid_name": "Water", "source": "iapws", "label": "IAPWS-IF97 Reference", "confidence": None, "properties": {}},
+        }
+        s.property_provenance = provenance
+        assert s.property_provenance is not None
+        assert s.property_provenance["hot_fluid"]["source"] == "iapws"
+

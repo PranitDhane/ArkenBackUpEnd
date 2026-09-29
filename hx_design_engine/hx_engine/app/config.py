@@ -1,0 +1,63 @@
+"""HX Engine configuration — reads from environment / .env file.
+
+All variables use the ``HX_`` prefix (e.g. ``HX_ANTHROPIC_API_KEY``,
+``HX_REDIS_URL``). See ``.env.example`` for the full list.
+"""
+
+from __future__ import annotations
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class HXEngineSettings(BaseSettings):
+    """All settings for the HX Engine microservice."""
+
+    # --- Redis ---
+    redis_url: str = "redis://localhost:6379/0"
+
+    # --- API ---
+    host: str = "0.0.0.0"
+    port: int = 8100
+    debug: bool = False
+
+    # --- Pipeline ---
+    pipeline_orphan_threshold_seconds: int = 120
+
+    # Maximum number of in-step AI escalation rounds the runner will perform
+    # before halting a step. Mechanical-design Layer 2 violations (Step 10
+    # ΔP / nozzle ρv²) are now handed to the RedesignDriver rather than
+    # escalated to the user, so this only governs the residual user-facing
+    # escalation loop.
+    max_internal_escalations: int = 4
+
+    # EPIC-XSTACK-2026-007-S1: Fluid Property Validation Gate
+    # When the AI is the only available source for a fluid's thermophysical
+    # properties, the pipeline pauses and asks the engineer to review the
+    # estimate if its confidence score is below this threshold.
+    # Override via HX_FLUID_PROPERTY_CONFIDENCE_THRESHOLD.
+    fluid_property_confidence_threshold: float = 0.70
+
+    ai_model: str = "claude-sonnet-4-6"
+    anthropic_api_key: str = ""  # HX_ANTHROPIC_API_KEY — enables live AI reviews when set
+
+    # --- Internal auth ---
+    hx_engine_secret: str = "dev-secret-change-me"
+    backend_url: str = "http://localhost:8001"
+    internal_secret: str = "dev-internal-secret"
+
+    # --- MongoDB (reads HX_MONGODB_URI and HX_MONGODB_DB_NAME via env_prefix) ---
+    mongodb_uri: str = ""
+    mongodb_db_name: str = "arken_process_db"
+
+    # --- Logging ---
+    log_level: str = "INFO"
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_prefix="HX_",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+
+settings = HXEngineSettings()

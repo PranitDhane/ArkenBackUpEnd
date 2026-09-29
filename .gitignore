@@ -1,0 +1,43 @@
+# Secrets / local environment (keep .env.example tracked)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+
+# Test / coverage output
+.coverage
+.coverage.*
+.coverage/
+coverage/
+htmlcov/
+
+# Build output
+build/
+dist/
+
+# Logs
+*.log
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS metadata
+.DS_Store
+Thumbs.db

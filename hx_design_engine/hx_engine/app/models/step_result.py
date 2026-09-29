@@ -1,0 +1,179 @@
+"""StepResult, StepRecord, and supporting enums/models for the pipeline."""
+
+from __future__ import annotations
+
+import enum
+from dataclasses import dataclass, field as dc_field
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+from pydantic import BaseModel, Field
+
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
+
+class AIModeEnum(str, enum.Enum):
+    FULL = "FULL"
+    CONDITIONAL = "CONDITIONAL"
+    NONE = "NONE"
+
+
+class AIDecisionEnum(str, enum.Enum):
+    PROCEED = "PROCEED"
+    CORRECT = "CORRECT"
+    WARN = "WARN"
+    ESCALATE = "ESCALATE"
+
+
+# ---------------------------------------------------------------------------
+# AI structures
+# ---------------------------------------------------------------------------
+
+class AICorrection(BaseModel):
+    """A single correction made by the AI engineer."""
+
+    field: str
+    old_value: Any = None
+    new_value: Any = None
+    reason: str = ""
+
+
+class AttemptRecord(BaseModel):
+    """Record of a single diagnostic correction attempt."""
+
+    attempt_number: int
+    diagnosis: str                          # AI's stated root cause
+    approach: str                           # human-readable summary of what was tried
+    corrections: list[AICorrection] = Field(default_factory=list)
+    layer2_outcome: str                     # "pass" | "fail"
+    layer2_rule_failed: Optional[str] = None  # first error message if Layer 2 failed
+    layer1_exception: Optional[str] = None    # exception message if Layer 1 threw
+    outcome: str                            # "success" | "failed"
+    confidence: float
+
+
+@dataclass
+class FailureContext:
+    """Transient context passed to the AI on retry calls.
+
+    Not stored on any model — built fresh each loop iteration from the
+    previous AttemptRecord. Lives only during the correction loop.
+    """
+
+    layer2_failed: bool
+    layer2_rule_description: Optional[str]   # str(exception) or first vr.error
+    layer1_exception: Optional[str]
+    previous_attempts: list[AttemptRecord] = dc_field(default_factory=list)
+
+
+class RedesignAttempt(BaseModel):
+    """One iteration of the global design-constraint redesign loop.
+
+    The redesign driver appends one of these to ``DesignState.redesign_history``
+    every time it catches a :class:`DesignConstraintViolation`, asks the AI
+    advisor (or its deterministic fallback) for a lever change, and restarts
+    the pipeline. Each attempt is a complete, self-contained record of:
+    why the previous run failed, which lever was tweaked, what its old/new
+    value was, what the AI's reasoning was, and which Layer-1/Layer-2
+    validations passed at the resulting iteration's exit point.
+    """
+
+    attempt_number: int = Field(..., ge=1)
+
+    # --- failure that triggered this attempt ---
+    failed_step_id: int
+    constraint: str                                   # e.g. "nozzle_envelope"
+    failing_value: Any = None
+    allowed_range: list[Optional[float]] = Field(
+        default_factory=lambda: [None, None]
+    )
+    failure_message: str = ""
+
+    # --- lever change applied (one or more parameters) ---
+    lever: str                                        # canonical lever name
+    old_value: Any = None
+    new_value: Any = None
+    direction: str = ""                                # "increase" | "decrease" | "swap"
+    rationale: str = ""                                # AI reasoning or fallback note
+
+    # --- AI provenance ---
+    ai_called: bool = False
+    ai_response_excerpt: str = ""                     # first ~200 chars of AI response
+    fallback_used: bool = False                        # True iff deterministic fallback fired
+
+    # --- outcome of the resulting pipeline run ---
+    outcome: str = "pending"                           # "pending" | "succeeded" | "failed" | "violation"
+    completed_steps: list[int] = Field(default_factory=list)
+
+
+class AIReview(BaseModel):
+    """Result of an AI review of a step's outputs."""
+
+    decision: AIDecisionEnum = AIDecisionEnum.PROCEED
+    confidence: float = 0.85
+    corrections: list[AICorrection] = Field(default_factory=list)
+    reasoning: str = ""
+    observation: str = ""
+    recommendation: Optional[str] = None  # required when decision == ESCALATE
+    options: list[str] = Field(default_factory=list)  # choices for the user
+    option_ratings: list[int] = Field(default_factory=list)  # 1–10 completeness score per option
+    attempts: list[AttemptRecord] = Field(default_factory=list)  # diagnostic trail
+    ai_called: bool = False
+
+    # --- Step 16 extras (only populated for final-validation review) ---
+    design_summary: Optional[str] = None
+    assumptions: list[str] = Field(default_factory=list)
+    design_strengths: list[str] = Field(default_factory=list)
+    design_risks: list[str] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
+    user_summary: Optional[str] = None
+
+    # --- EPIC-XSTACK-2026-007-S1: Property escalation extras ---
+    # Set when decision == ESCALATE and the reason is a fluid property
+    # resolution failure (low-confidence AI estimate or no estimate at all).
+    event_subtype: Optional[str] = None                    # e.g. "property_request"
+    property_request_payload: Optional[dict] = None        # structured payload for frontend PropertyRequestCard
+
+
+# ---------------------------------------------------------------------------
+# StepResult
+# ---------------------------------------------------------------------------
+
+class StepResult(BaseModel):
+    """Returned by every step's execute() method."""
+
+    step_id: int
+    step_name: str
+    outputs: dict[str, Any] = Field(default_factory=dict)
+    validation_passed: bool = True
+    validation_errors: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    ai_review: Optional[AIReview] = None
+
+
+# ---------------------------------------------------------------------------
+# StepRecord — audit log entry stored in DesignState.step_records
+# ---------------------------------------------------------------------------
+
+class StepRecord(BaseModel):
+    """Immutable audit record of a step execution."""
+
+    step_id: int
+    step_name: str
+    started_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    duration_s: Optional[float] = None
+    ai_decision: Optional[AIDecisionEnum] = None
+    ai_confidence: Optional[float] = None
+    ai_called: bool = False
+    validation_passed: bool = True
+    validation_errors: list[str] = Field(default_factory=list)
+    outputs: dict[str, Any] = Field(default_factory=dict, alias="outputs_snapshot")
+    warnings: list[str] = Field(default_factory=list)
+    # Full AI review stored for audit / frontend restore
+    ai_review: Optional[AIReview] = None
+
+    model_config = {"populate_by_name": True}
